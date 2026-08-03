@@ -1,0 +1,72 @@
+#!/bin/sh
+
+set -eu
+
+WORK_DIR=$(mktemp -d)
+SOURCE_DIR="$WORK_DIR/source"
+BUILD_DIR="$WORK_DIR/build"
+STAGE_DIR="$WORK_DIR/stage"
+
+cleanup()
+{
+    rm -rf "$WORK_DIR"
+}
+trap cleanup EXIT HUP INT TERM
+
+echo "ci: preparing a private writable source tree"
+cp -a /source "$SOURCE_DIR"
+mkdir "$BUILD_DIR" "$STAGE_DIR"
+export XDG_CACHE_HOME="$WORK_DIR/cache"
+mkdir "$XDG_CACHE_HOME"
+
+echo "ci: configuring GLib 2.39.92"
+cd "$BUILD_DIR"
+"$SOURCE_DIR/configure" \
+    --prefix=/usr \
+    --disable-compile-warnings \
+    --disable-fam \
+    --disable-libelf \
+    --disable-maintainer-mode \
+    --disable-man \
+    --disable-selinux \
+    --disable-systemtap \
+    --disable-dtrace \
+    --enable-static \
+    --with-pcre=internal
+
+echo "ci: building the historical GLib core library"
+make -C glib -j8
+
+ALL_TESTS=$(make -s --no-print-directory -C glib/tests \
+    --eval='print-tests: ; @printf "%s\n" "$(TESTS)"' print-tests)
+case " $ALL_TESTS " in
+    *" gdatetime "*) ;;
+    *)
+        echo "ci: expected gdatetime in the historical core test set" >&2
+        exit 1
+        ;;
+esac
+COMPATIBLE_TESTS=$(make -s --no-print-directory -C glib/tests \
+    --eval='print-tests: ; @printf "%s\n" "$(filter-out gdatetime,$(TESTS))"' \
+    print-tests)
+
+echo "ci: running all Trixie-compatible upstream GLib core tests"
+if ! timeout 600 make -C glib/tests check \
+    TESTS="$COMPATIBLE_TESTS" \
+    LOG_COMPILER="$SOURCE_DIR/.github/ci/tap-test"; then
+    if test -f glib/tests/test-suite.log; then
+        echo "ci: GLib core test diagnostics follow"
+        cat glib/tests/test-suite.log
+    fi
+    exit 1
+fi
+
+echo "ci: staging and checking the historical GLib core interface"
+make -C glib DESTDIR="$STAGE_DIR" install
+test -f "$STAGE_DIR/usr/include/glib-2.0/glib.h"
+test -f "$STAGE_DIR/usr/lib/libglib-2.0.a"
+grep -Fx 'm4_define([glib_major_version], [2])' "$SOURCE_DIR/configure.ac"
+grep -Fx 'm4_define([glib_minor_version], [39])' "$SOURCE_DIR/configure.ac"
+grep -Fx 'm4_define([glib_micro_version], [92])' "$SOURCE_DIR/configure.ac"
+
+echo "ci: all historical Abuild GLib checks passed"
